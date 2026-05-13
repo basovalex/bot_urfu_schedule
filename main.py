@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time, timezone
 from typing import Optional, List, Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 from zoneinfo import ZoneInfo
 
 
@@ -66,6 +66,13 @@ MODEUS_SCHEDULE_URL = (
     "&grid=%22Grid.07%22"
 )
 MODEUS_EVENTS_URL = "https://urfu.modeus.org/schedule-calendar-v2/api/calendar/events/search"
+MODEUS_PROXY_URL = (
+    os.getenv("MODEUS_PROXY_URL")
+    or os.getenv("HTTPS_PROXY")
+    or os.getenv("HTTP_PROXY")
+    or ""
+).strip()
+PLAYWRIGHT_PROXY_URL = (os.getenv("PLAYWRIGHT_PROXY_URL") or MODEUS_PROXY_URL).strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -412,9 +419,10 @@ class UrfuScheduleClient:
     def __init__(self) -> None:
         self.session: Optional[ClientSession] = None
         self.last_modeus_session: Optional[dict[str, Any]] = None
+        self.proxy_url: Optional[str] = MODEUS_PROXY_URL or None
 
     async def __aenter__(self):
-        self.session = ClientSession(timeout=ClientTimeout(total=45))
+        self.session = ClientSession(timeout=ClientTimeout(total=45), trust_env=True)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -545,6 +553,7 @@ class UrfuScheduleClient:
                 params={"tz": "Asia/Yekaterinburg"},
                 headers=headers,
                 json=body,
+                proxy=self.proxy_url,
             )
 
         resp = await _request_events(token)
@@ -634,6 +643,7 @@ class UrfuScheduleClient:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
         captured_jwt_token: Optional[str] = None
+        proxy_settings = self._build_playwright_proxy_settings()
 
         def capture_auth_header(request):
             nonlocal captured_jwt_token
@@ -646,10 +656,17 @@ class UrfuScheduleClient:
         with sync_playwright() as p:
             try:
                 # Prefer system Chrome so we do not depend on downloaded Playwright binaries.
-                browser = p.chromium.launch(channel="chrome", headless=True)
+                browser = p.chromium.launch(
+                    channel="chrome",
+                    headless=True,
+                    proxy=proxy_settings,
+                )
             except PlaywrightError:
                 # Fallback to bundled chromium if it is available.
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    proxy=proxy_settings,
+                )
             context = browser.new_context()
             page = context.new_page()
             page.on("request", capture_auth_header)
@@ -708,6 +725,23 @@ class UrfuScheduleClient:
         if not captured_jwt_token:
             raise ValueError("Не удалось получить access token Modeus")
         return captured_jwt_token
+
+    def _build_playwright_proxy_settings(self) -> Optional[dict[str, str]]:
+        proxy = PLAYWRIGHT_PROXY_URL.strip()
+        if not proxy:
+            return None
+        parsed = urlparse(proxy)
+        if not parsed.scheme or not parsed.hostname:
+            logger.warning("PLAYWRIGHT proxy URL is invalid: %s", proxy)
+            return None
+        settings: dict[str, str] = {
+            "server": f"{parsed.scheme}://{parsed.hostname}{f':{parsed.port}' if parsed.port else ''}"
+        }
+        if parsed.username:
+            settings["username"] = unquote(parsed.username)
+        if parsed.password:
+            settings["password"] = unquote(parsed.password)
+        return settings
 
     def _decode_jwt_payload(self, token: str) -> dict[str, Any]:
         parts = token.split(".")
@@ -1495,7 +1529,12 @@ def week_range_by_offset(week_offset: int) -> tuple[datetime.date, datetime.date
 
 async def get_schedule_payload_for_week(telegram_id: int, week_offset: int) -> dict:
     user = await get_user(telegram_id)
-    if not user or not is_user_authorized(user):
+    if not user:
+        raise ValueError("Сначала авторизуйся через кнопку «🔐 Авторизоваться».")
+
+    has_login = bool((user.get("urfu_login") or "").strip())
+    has_decryptable_password = bool(decrypt_password(user.get("urfu_password")))
+    if not has_login or (not is_user_authorized(user) and not has_decryptable_password):
         raise ValueError("Сначала авторизуйся через кнопку «🔐 Авторизоваться».")
 
     return await fetch_schedule_payload_for_user(user, week_offset)

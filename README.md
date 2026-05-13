@@ -45,6 +45,8 @@ Optional:
 - `DATABASE_PATH` (default: `bot.db`)
 - `MORNING_HOUR` (default: `7`)
 - `MORNING_MINUTE` (default: `0`)
+- `MODEUS_PROXY_URL` (e.g. `http://user:pass@host:port`) for API requests
+- `PLAYWRIGHT_PROXY_URL` (if omitted, uses `MODEUS_PROXY_URL`) for browser auth flow
 - `CALENDAR_LINK_BASE_URL`, `CALENDAR_LINK_HOST`, `CALENDAR_LINK_PORT` (for public iPhone calendar links)
 
 Generate a strong encryption key, for example:

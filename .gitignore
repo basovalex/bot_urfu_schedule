@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+bot.db
+importtime.log
+
+.DS_Store

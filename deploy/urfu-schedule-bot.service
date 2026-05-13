@@ -1,0 +1,18 @@
+[Unit]
+Description=URFU Schedule Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/urfu-schedule-bot
+EnvironmentFile=/opt/urfu-schedule-bot/.env
+ExecStart=/opt/urfu-schedule-bot/.venv/bin/python /opt/urfu-schedule-bot/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

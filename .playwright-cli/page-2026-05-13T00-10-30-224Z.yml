@@ -1,0 +1,23 @@
+- generic [ref=e5]:
+  - generic [ref=e6]:
+    - img "Уральский федеральный университет" [ref=e8]
+    - main [ref=e9]:
+      - generic [ref=e12]:
+        - generic [ref=e13]: Вход
+        - generic [ref=e14]:
+          - alert [ref=e16]: Неверный идентификатор пользователя или пароль. Введите верный идентификатор пользователя и пароль и повторите попытку.
+          - generic [ref=e17]:
+            - textbox "Учетная запись пользователя" [ref=e19]:
+              - /placeholder: proverka@example.com
+              - text: basovalex206@gmail.com
+            - textbox "Пароль" [active] [ref=e21]
+            - button "Вход" [ref=e23] [cursor=pointer]
+  - contentinfo:
+    - generic [ref=e26]:
+      - link "Получить учетную запись" [ref=e27] [cursor=pointer]:
+        - /url: https://id.urfu.ru/AccessManagement/Identify/GetAccount?language=ru
+      - link "Восстановить пароль" [ref=e28] [cursor=pointer]:
+        - /url: https://id.urfu.ru/AccessManagement/Identify/ResetPassword?language=ru
+      - link "Онлайн-форма технической поддержки" [ref=e29] [cursor=pointer]:
+        - /url: http://dit.urfu.ru/servisy/polzovateljam-korporativnykh-servisov/formy-onlain-obrashchenii/
+    - text: Техническая поддержка +7 (343) 227-20-70, support@urfu.ru

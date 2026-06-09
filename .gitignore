@@ -1,9 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
+.idea/
 
 .env
 bot.db
 importtime.log
+constants.py
+test_modeus_proxy_playwright.py
+.playwright-cli/
 
 .DS_Store

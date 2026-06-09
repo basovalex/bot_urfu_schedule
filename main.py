@@ -1,14 +1,15 @@
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, time, timezone
 from typing import Optional, List, Any
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import parse_qs, urlparse, urlencode
 from zoneinfo import ZoneInfo
 
 
@@ -29,19 +30,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_FALLBACK_COOKIES: Optional[dict[str, Any]] = None
-_FALLBACK_HEADERS: Optional[dict[str, Any]] = None
-
-
-def get_fallback_auth() -> tuple[dict[str, Any], dict[str, Any]]:
-    global _FALLBACK_COOKIES, _FALLBACK_HEADERS
-    if _FALLBACK_COOKIES is None or _FALLBACK_HEADERS is None:
-        from constants import COOKIES, HEADERS
-
-        _FALLBACK_COOKIES = COOKIES
-        _FALLBACK_HEADERS = HEADERS
-    return _FALLBACK_COOKIES, _FALLBACK_HEADERS
-
 # ==============================
 # CONFIG
 # ==============================
@@ -50,29 +38,22 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db").strip() or "bot.db"
 TIMEZONE = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "7"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "0"))
+SCHEDULE_CACHE_TTL_SECONDS = int(os.getenv("SCHEDULE_CACHE_TTL_SECONDS", "900"))
+BRS_CACHE_TTL_SECONDS = int(os.getenv("BRS_CACHE_TTL_SECONDS", "1800"))
+STALE_CACHE_TTL_SECONDS = int(os.getenv("STALE_CACHE_TTL_SECONDS", "86400"))
 
-#
-# IMPORTANT:
-# 1) Replace BASE_LOGIN_URL and BASE_SCHEDULE_URL with real UrFU endpoints.
-# 2) Replace parse_* functions with your actual parser.
-# 3) Prefer storing auth cookies/tokens instead of raw password in production.
-#
-BASE_LOGIN_URL = "https://example.urfu.ru/login"
+ISTUDENT_BASE_URL = "https://istudent.urfu.ru"
+ISTUDENT_LOGIN_URL = f"{ISTUDENT_BASE_URL}/student/login"
+ISTUDENT_SCHEDULE_PAGE_URL = f"{ISTUDENT_BASE_URL}/s/schedule"
 BASE_SCHEDULE_URL = "https://istudent.urfu.ru/s/schedule/schedule"
-MODEUS_SCHEDULE_URL = (
-    "https://urfu.modeus.org/schedule-calendar/my"
-    "?timeZone=%22Asia%2FYekaterinburg%22"
-    "&calendar=%7B%22view%22:%22agendaWeek%22,%22date%22:%222025-09-29%22%7D"
-    "&grid=%22Grid.07%22"
-)
-MODEUS_EVENTS_URL = "https://urfu.modeus.org/schedule-calendar-v2/api/calendar/events/search"
-MODEUS_PROXY_URL = (
-    os.getenv("MODEUS_PROXY_URL")
+ISTUDENT_TOKEN_URL = "https://keys.urfu.ru/auth/realms/urfu-lk/protocol/openid-connect/token"
+BRS_BASE_URL = "https://istudent.urfu.ru/s/http-urfu-ru-ru-students-study-brs"
+URFU_PROXY_URL = (
+    os.getenv("URFU_PROXY_URL")
     or os.getenv("HTTPS_PROXY")
     or os.getenv("HTTP_PROXY")
     or ""
 ).strip()
-PLAYWRIGHT_PROXY_URL = (os.getenv("PLAYWRIGHT_PROXY_URL") or MODEUS_PROXY_URL).strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,16 +62,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 router = Router()
+_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 WELCOME_TEXT = (
     "Привет! Я бот с расписанием УрФУ.\n\n"
     "Сначала авторизуйся один раз через кнопку 🔐, чтобы я мог получать твое расписание.\n\n"
-    "Выбирай нужный вариант внизу:\n"
+    "Выбирай нужный раздел:\n"
     "• 📅 Сегодня\n"
-    "• 🗓 Выбрать неделю\n"
+    "• 🗓 Неделя\n"
+    "• 📊 Баллы БРС\n"
     "• ⏰ Напоминания\n"
-    "• 🔐 Авторизация"
+    "• 🔐 Профиль"
 )
 
 
@@ -102,9 +85,6 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
     urfu_login TEXT NOT NULL,
     urfu_password TEXT NOT NULL,
-    modeus_access_token TEXT,
-    modeus_person_id TEXT,
-    modeus_token_exp INTEGER,
     notifications_enabled INTEGER NOT NULL DEFAULT 1,
     pair_reminders_enabled INTEGER NOT NULL DEFAULT 1,
     pair_reminder_days TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
@@ -133,12 +113,21 @@ CREATE TABLE IF NOT EXISTS sent_pair_reminders (
 );
 """
 
+CREATE_RESPONSE_CACHE_SQL = """
+CREATE TABLE IF NOT EXISTS response_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+"""
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(CREATE_USERS_SQL)
         await db.execute(CREATE_SENT_LOG_SQL)
         await db.execute(CREATE_PAIR_REMINDER_LOG_SQL)
+        await db.execute(CREATE_RESPONSE_CACHE_SQL)
         await ensure_users_columns(db)
         await db.commit()
 
@@ -148,9 +137,6 @@ async def ensure_users_columns(db: aiosqlite.Connection) -> None:
     rows = await cursor.fetchall()
     existing = {row[1] for row in rows}
     required = {
-        "modeus_access_token": "TEXT",
-        "modeus_person_id": "TEXT",
-        "modeus_token_exp": "INTEGER",
         "pair_reminders_enabled": "INTEGER NOT NULL DEFAULT 1",
         "pair_reminder_days": "TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6'",
     }
@@ -209,9 +195,6 @@ async def upsert_user_credentials(telegram_id: int, login: str, password: str) -
             ON CONFLICT(telegram_id) DO UPDATE SET
                 urfu_login = excluded.urfu_login,
                 urfu_password = excluded.urfu_password,
-                modeus_access_token = NULL,
-                modeus_person_id = NULL,
-                modeus_token_exp = NULL,
                 updated_at = excluded.updated_at
             """,
             (telegram_id, login, encrypted_password, now, now),
@@ -230,55 +213,12 @@ async def get_user(telegram_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
-async def save_modeus_session(
-    telegram_id: int,
-    access_token: str,
-    person_id: str,
-    token_exp: int,
-) -> None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            """
-            UPDATE users
-            SET modeus_access_token = ?,
-                modeus_person_id = ?,
-                modeus_token_exp = ?,
-                updated_at = ?
-            WHERE telegram_id = ?
-            """,
-            (
-                access_token,
-                person_id,
-                token_exp,
-                datetime.now(TIMEZONE).isoformat(),
-                telegram_id,
-            ),
-        )
-        await db.commit()
-
-
-def get_persisted_modeus_session(user: dict) -> Optional[dict[str, Any]]:
-    token = user.get("modeus_access_token")
-    person_id = user.get("modeus_person_id")
-    token_exp = user.get("modeus_token_exp")
-    if not token or not person_id or not token_exp:
-        return None
-    return {
-        "access_token": token,
-        "person_id": person_id,
-        "token_exp": int(token_exp),
-    }
-
-
 def is_user_authorized(user: Optional[dict]) -> bool:
     if not user:
         return False
-    if not (user.get("urfu_login") and user.get("modeus_access_token") and user.get("modeus_token_exp")):
+    if not user.get("urfu_login"):
         return False
-    try:
-        return int(user["modeus_token_exp"]) > int(datetime.now(timezone.utc).timestamp())
-    except Exception:
-        return False
+    return bool(decrypt_password(user.get("urfu_password")))
 
 
 def get_reminder_days(user: Optional[dict]) -> set[int]:
@@ -384,6 +324,58 @@ async def mark_pair_reminder_sent(telegram_id: int, reminder_key: str) -> None:
         await db.commit()
 
 
+def get_cache_lock(cache_key: str) -> asyncio.Lock:
+    lock = _CACHE_LOCKS.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CACHE_LOCKS[cache_key] = lock
+    return lock
+
+
+async def get_cached_response(cache_key: str, max_age_seconds: int) -> Optional[Any]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(CREATE_RESPONSE_CACHE_SQL)
+        cursor = await db.execute(
+            "SELECT payload, fetched_at FROM response_cache WHERE cache_key = ?",
+            (cache_key,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+
+    try:
+        fetched_at = datetime.fromisoformat(row[1])
+        age = (datetime.now(TIMEZONE) - fetched_at.astimezone(TIMEZONE)).total_seconds()
+        if age > max_age_seconds:
+            return None
+        return json.loads(row[0])
+    except Exception:
+        logger.exception("Failed to read cached response for key=%s", cache_key)
+        return None
+
+
+async def set_cached_response(cache_key: str, payload: Any) -> None:
+    try:
+        payload_json = json.dumps(payload, ensure_ascii=False)
+    except TypeError:
+        logger.exception("Failed to serialize cached response for key=%s", cache_key)
+        return
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(CREATE_RESPONSE_CACHE_SQL)
+        await db.execute(
+            """
+            INSERT INTO response_cache (cache_key, payload, fetched_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (cache_key, payload_json, datetime.now(TIMEZONE).isoformat()),
+        )
+        await db.commit()
+
+
 # ==============================
 # FSM
 # ==============================
@@ -404,22 +396,143 @@ class Lesson:
     lesson_type: str
 
 
+@dataclass
+class BrsOption:
+    value: str
+    label: str
+    selected: bool = False
+
+
+@dataclass
+class BrsDiscipline:
+    discipline_id: str
+    name: str
+    score: str
+    grade: str
+    is_selected: bool
+    is_actual: bool
+    is_visible_by_default: bool
+    survey_required: bool
+
+
+@dataclass
+class BrsReport:
+    group_title: str
+    program_title: str
+    current_year: str
+    current_year_label: str
+    current_semester: str
+    current_semester_label: str
+    years: list[BrsOption]
+    semesters: list[BrsOption]
+    disciplines: list[BrsDiscipline]
+
+
+@dataclass
+class BrsDetailAttestation:
+    title: str
+    expression: str
+    controls: list[str]
+
+
+@dataclass
+class BrsDetailSection:
+    title: str
+    expression: str
+    attestations: list[BrsDetailAttestation]
+
+
+@dataclass
+class BrsDisciplineDetail:
+    discipline_id: str
+    name: str
+    score: str
+    site_grade: str
+    teachers: list[str]
+    sections: list[BrsDetailSection]
+
+
+def brs_report_to_dict(report: BrsReport) -> dict[str, Any]:
+    return asdict(report)
+
+
+def brs_report_from_dict(data: dict[str, Any]) -> BrsReport:
+    return BrsReport(
+        group_title=data.get("group_title", ""),
+        program_title=data.get("program_title", ""),
+        current_year=data.get("current_year", ""),
+        current_year_label=data.get("current_year_label", ""),
+        current_semester=data.get("current_semester", ""),
+        current_semester_label=data.get("current_semester_label", ""),
+        years=[BrsOption(**item) for item in data.get("years", [])],
+        semesters=[BrsOption(**item) for item in data.get("semesters", [])],
+        disciplines=[BrsDiscipline(**item) for item in data.get("disciplines", [])],
+    )
+
+
+def brs_detail_to_dict(detail: BrsDisciplineDetail) -> dict[str, Any]:
+    return asdict(detail)
+
+
+def brs_detail_from_dict(data: dict[str, Any]) -> BrsDisciplineDetail:
+    return BrsDisciplineDetail(
+        discipline_id=data.get("discipline_id", ""),
+        name=data.get("name", ""),
+        score=data.get("score", ""),
+        site_grade=data.get("site_grade", ""),
+        teachers=list(data.get("teachers", [])),
+        sections=[
+            BrsDetailSection(
+                title=section.get("title", ""),
+                expression=section.get("expression", ""),
+                attestations=[
+                    BrsDetailAttestation(
+                        title=attestation.get("title", ""),
+                        expression=attestation.get("expression", ""),
+                        controls=list(attestation.get("controls", [])),
+                    )
+                    for attestation in section.get("attestations", [])
+                ],
+            )
+            for section in data.get("sections", [])
+        ],
+    )
+
+
+def current_brs_period(today: Optional[datetime.date] = None) -> tuple[str, str]:
+    current_date = today or datetime.now(TIMEZONE).date()
+    if current_date.month >= 9:
+        return str(current_date.year), "autumn"
+    return str(current_date.year - 1), "spring"
+
+
+def resolve_brs_period(year: Optional[str], semester: Optional[str]) -> tuple[str, str]:
+    auto_year, auto_semester = current_brs_period()
+    return year or auto_year, semester or auto_semester
+
+
+def estimate_semester_number(group_title: str, academic_year: str, semester: str) -> Optional[int]:
+    group_match = re.search(r"[-–](\d{2})", group_title or "")
+    year_match = re.search(r"(\d{4})", academic_year or "")
+    if not group_match or not year_match:
+        return None
+
+    enrollment_year = 2000 + int(group_match.group(1))
+    academic_start_year = int(year_match.group(1))
+    semester_number = (academic_start_year - enrollment_year) * 2
+    semester_number += 1 if semester == "autumn" else 2
+    return semester_number if semester_number > 0 else None
+
+
 # ==============================
-# URFU CLIENT (TEMPLATE)
+# URFU CLIENT
 # ==============================
 class UrfuScheduleClient:
-    """
-    Template client.
-    Replace auth and parsing logic with actual UrFU endpoints/selectors.
-    """
-
-    _modeus_token_cache: dict[str, dict[str, Any]] = {}
-    _modeus_auth_lock: Optional[asyncio.Lock] = None
+    _istudent_token_cache: dict[str, dict[str, Any]] = {}
 
     def __init__(self) -> None:
         self.session: Optional[ClientSession] = None
-        self.last_modeus_session: Optional[dict[str, Any]] = None
-        self.proxy_url: Optional[str] = MODEUS_PROXY_URL or None
+        self.proxy_url: Optional[str] = URFU_PROXY_URL or None
 
     async def __aenter__(self):
         self.session = ClientSession(timeout=ClientTimeout(total=45), trust_env=True)
@@ -433,52 +546,38 @@ class UrfuScheduleClient:
         if self.session is None:
             raise RuntimeError("Session is not initialized")
 
-        # TEMPLATE:
-        # resp = await self.session.post(BASE_LOGIN_URL, data={"login": login, "password": password})
-        # html = await resp.text()
-        # return resp.status == 200 and "logout" in html.lower()
-
         if not login or not password:
             return False
-        return True
+        try:
+            await self._fetch_istudent_access_token(login, password, force_refresh=True)
+            return True
+        except Exception:
+            logger.exception("iStudent auth check failed for user %s", login.strip().lower())
+            return False
 
     async def fetch_week_schedule(
         self,
         login: str,
         password: Optional[str],
         week_offset: int = 0,
-        persisted_modeus_session: Optional[dict[str, Any]] = None,
     ) -> dict:
         if self.session is None:
             raise RuntimeError("Session is not initialized")
 
         logger.info("Fetch week schedule requested: week_offset=%s", week_offset)
-        try:
-            logger.info("Trying Modeus API flow")
-            return await self.fetch_modeus_week_schedule(
-                login,
-                password,
-                week_offset,
-                persisted_modeus_session=persisted_modeus_session,
-            )
-        except Exception:
-            # Security-first behavior: do not fallback to shared legacy cookies,
-            # otherwise there is a risk of returning schedule from a foreign session.
-            logger.exception("Modeus API failed")
-            raise
+        logger.info("Trying iStudent schedule flow")
+        return await self.fetch_istudent_week_schedule(login, password or "", week_offset)
 
 
     async def fetch_today_schedule(
         self,
         login: str,
         password: Optional[str],
-        persisted_modeus_session: Optional[dict[str, Any]] = None,
     ) -> dict:
         all_week = await self.fetch_week_schedule(
             login,
             password,
             week_offset=0,
-            persisted_modeus_session=persisted_modeus_session,
         )
 
         today = datetime.now(TIMEZONE).date()
@@ -502,270 +601,283 @@ class UrfuScheduleClient:
 
         return today_lessons
 
+    async def fetch_istudent_week_schedule(
+        self,
+        login: str,
+        password: str,
+        week_offset: int,
+    ) -> dict:
+        if self.session is None:
+            raise RuntimeError("Session is not initialized")
+        if not login or not password:
+            raise ValueError("Для расписания iStudent нужен сохраненный логин и пароль УрФУ.")
+
+        token = await self._fetch_istudent_access_token(login, password)
+        headers = self._istudent_headers(referer=ISTUDENT_SCHEDULE_PAGE_URL, ajax=True)
+        cookies = {"keycloakAccessToken": token}
+
+        login_resp = await self.session.get(
+            self._build_istudent_login_url(ISTUDENT_SCHEDULE_PAGE_URL),
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        await login_resp.text()
+        if login_resp.status != 200:
+            raise ValueError(f"iStudent авторизация вернула статус {login_resp.status}")
+
+        monday, sunday = self._week_range(week_offset)
+        combined = {"online": [], "offline": []}
+        seen_lessons = set()
+        for window_start in (monday, monday - timedelta(days=7)):
+            start_time = int(datetime.combine(window_start, time(0, 0), tzinfo=TIMEZONE).timestamp())
+            resp = await self.session.get(
+                BASE_SCHEDULE_URL,
+                params={"startTime": start_time},
+                headers=headers,
+                cookies=cookies,
+                allow_redirects=True,
+                proxy=self.proxy_url,
+            )
+            payload = await resp.text()
+            if resp.status != 200:
+                raise ValueError(f"iStudent расписание вернуло статус {resp.status}")
+            if "/student/keycloak-login" in str(resp.url):
+                raise ValueError("Не удалось создать сессию iStudent для расписания.")
+
+            parsed = self._filter_schedule_by_period(
+                self.parse_schedule_html(payload),
+                monday,
+                sunday,
+            )
+            for bucket in ("offline", "online"):
+                for lesson in parsed.get(bucket, []):
+                    key = (
+                        lesson.get("date"),
+                        lesson.get("time"),
+                        lesson.get("number_lesson"),
+                        lesson.get("name"),
+                        lesson.get("place"),
+                    )
+                    if key in seen_lessons:
+                        continue
+                    seen_lessons.add(key)
+                    combined[bucket].append(lesson)
+            if combined["offline"] or combined["online"]:
+                break
+        return combined
+
+    async def fetch_brs_report(
+        self,
+        login: str,
+        password: Optional[str],
+        year: Optional[str] = None,
+        semester: Optional[str] = None,
+    ) -> BrsReport:
+        if self.session is None:
+            raise RuntimeError("Session is not initialized")
+        if not login or not password:
+            raise ValueError("Для БРС нужен сохраненный логин и пароль УрФУ.")
+
+        token = await self._fetch_istudent_access_token(login, password)
+        headers = self._istudent_headers(referer=BRS_BASE_URL)
+        cookies = {"keycloakAccessToken": token}
+
+        login_resp = await self.session.get(
+            self._build_istudent_login_url(BRS_BASE_URL),
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        await login_resp.text()
+        if login_resp.status != 200:
+            raise ValueError(f"iStudent авторизация вернула статус {login_resp.status}")
+
+        brs_url = self._build_brs_url(year=year, semester=semester)
+        resp = await self.session.get(
+            brs_url,
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        payload = await resp.text()
+        if resp.status != 200:
+            raise ValueError(f"БРС вернул статус {resp.status}")
+        if "/student/keycloak-login" in str(resp.url):
+            raise ValueError("Не удалось создать сессию iStudent для БРС.")
+
+        return self.parse_brs_html(payload)
+
+    async def fetch_brs_discipline_detail(
+        self,
+        login: str,
+        password: Optional[str],
+        discipline: BrsDiscipline,
+        year: Optional[str] = None,
+        semester: Optional[str] = None,
+    ) -> BrsDisciplineDetail:
+        if self.session is None:
+            raise RuntimeError("Session is not initialized")
+        if not login or not password:
+            raise ValueError("Для детализации БРС нужен сохраненный логин и пароль УрФУ.")
+        if not discipline.discipline_id:
+            raise ValueError("У дисциплины нет идентификатора для детализации.")
+
+        token = await self._fetch_istudent_access_token(login, password)
+        headers = self._istudent_headers(referer=BRS_BASE_URL, ajax=True)
+        cookies = {"keycloakAccessToken": token}
+        report_url = self._build_brs_url(year=year, semester=semester)
+
+        login_resp = await self.session.get(
+            self._build_istudent_login_url(report_url),
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        await login_resp.text()
+        if login_resp.status != 200:
+            raise ValueError(f"iStudent авторизация вернула статус {login_resp.status}")
+
+        report_resp = await self.session.get(
+            report_url,
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        await report_resp.text()
+        if report_resp.status != 200:
+            raise ValueError(f"БРС вернул статус {report_resp.status}")
+
+        detail_resp = await self.session.get(
+            f"{BRS_BASE_URL}/discipline",
+            params={
+                "disciplineId": discipline.discipline_id,
+                "backlink": str(report_resp.url),
+            },
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=True,
+            proxy=self.proxy_url,
+        )
+        payload = await detail_resp.text()
+        if detail_resp.status != 200:
+            raise ValueError(f"Детализация БРС вернула статус {detail_resp.status}")
+        if "/student/keycloak-login" in str(detail_resp.url):
+            raise ValueError("Не удалось создать сессию iStudent для детализации БРС.")
+
+        return self.parse_brs_discipline_detail_html(payload, discipline)
+
+    async def _fetch_istudent_access_token(self, login: str, password: str, force_refresh: bool = False) -> str:
+        if self.session is None:
+            raise RuntimeError("Session is not initialized")
+
+        cache_key = login.strip().lower()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        cached = self._istudent_token_cache.get(cache_key)
+        if (
+            cached
+            and not force_refresh
+            and cached.get("password_hash") == hashlib.sha256(password.encode("utf-8")).hexdigest()
+            and int(cached.get("exp") or 0) - 60 > now_ts
+        ):
+            return cached["token"]
+
+        resp = await self.session.post(
+            ISTUDENT_TOKEN_URL,
+            data={
+                "grant_type": "password",
+                "client_id": "istudent",
+                "username": login,
+                "password": password,
+                "scope": "openid",
+            },
+            headers={"Accept": "application/json"},
+            proxy=self.proxy_url,
+        )
+        try:
+            payload = await resp.json(content_type=None)
+        except Exception as exc:
+            raise ValueError(f"Keycloak iStudent вернул статус {resp.status}") from exc
+
+        if resp.status != 200:
+            error = (payload.get("error_description") or payload.get("error") or "").lower()
+            if "invalid" in error or "парол" in error or "credential" in error:
+                raise ValueError("Неверный логин или пароль УрФУ для iStudent.")
+            raise ValueError(f"Keycloak iStudent вернул статус {resp.status}")
+
+        token = payload.get("access_token")
+        if not token:
+            raise ValueError("Keycloak iStudent не вернул access_token")
+        claims = self._decode_jwt_payload(token)
+        exp = int(claims.get("exp") or (now_ts + 300))
+        self._istudent_token_cache[cache_key] = {
+            "token": token,
+            "exp": exp,
+            "password_hash": hashlib.sha256(password.encode("utf-8")).hexdigest(),
+        }
+        return token
+
+    def _decode_jwt_payload(self, token: str) -> dict[str, Any]:
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return {}
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _build_brs_url(self, year: Optional[str] = None, semester: Optional[str] = None) -> str:
+        params = {}
+        if year and year != "0":
+            params["year"] = year
+        if semester and semester != "0":
+            params["semester"] = semester
+        if not params:
+            return BRS_BASE_URL
+        return f"{BRS_BASE_URL}?{urlencode(params)}"
+
+    def _build_istudent_login_url(self, backlink_url: str) -> str:
+        backlink = backlink_url.replace("https://", "http://", 1)
+        return f"{ISTUDENT_LOGIN_URL}?{urlencode({'backlink': backlink})}"
+
+    def _istudent_headers(self, referer: str, ajax: bool = False) -> dict[str, str]:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Referer": referer,
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+        }
+        if ajax:
+            headers["Accept"] = "text/html, */*; q=0.01"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+        return headers
+
     def _week_range(self, week_offset: int = 0):
         now = datetime.now(TIMEZONE).date()
         monday = now - timedelta(days=now.weekday()) + timedelta(weeks=week_offset)
         sunday = monday + timedelta(days=6)
         return monday, sunday
 
-    async def fetch_modeus_week_schedule(
-        self,
-        login: str,
-        password: Optional[str],
-        week_offset: int,
-        persisted_modeus_session: Optional[dict[str, Any]] = None,
-    ) -> dict:
-        if self.session is None:
-            raise RuntimeError("Session is not initialized")
-        if not login:
-            raise ValueError("Нужен логин УрФУ для доступа к Modeus")
-
-        token, person_id, exp = await self._ensure_modeus_auth(
-            login,
-            password,
-            preferred_session=persisted_modeus_session,
-        )
-        time_min, time_max = self._modeus_week_range_utc(week_offset)
-        logger.info(
-            "Modeus events request: person_id=%s week_offset=%s timeMin=%s timeMax=%s",
-            person_id,
-            week_offset,
-            time_min,
-            time_max,
-        )
-        body = {
-            "size": 500,
-            "timeMin": time_min,
-            "timeMax": time_max,
-            "attendeePersonId": [person_id],
-        }
-
-        async def _request_events(bearer_token: str):
-            headers = {
-                "Authorization": f"Bearer {bearer_token}",
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/json",
-                "Referer": MODEUS_SCHEDULE_URL,
-                "Accept-Language": "ru-RU",
-            }
-            return await self.session.post(
-                MODEUS_EVENTS_URL,
-                params={"tz": "Asia/Yekaterinburg"},
-                headers=headers,
-                json=body,
-                proxy=self.proxy_url,
-            )
-
-        resp = await _request_events(token)
-        if resp.status == 401:
-            logger.warning("Modeus token rejected with 401, refreshing token")
-            if not password:
-                raise ValueError("Сессия истекла. Нажми «🔐 Авторизоваться» и введи пароль заново.")
-            token, person_id, exp = await self._ensure_modeus_auth(login, password, force_refresh=True)
-            body["attendeePersonId"] = [person_id]
-            resp = await _request_events(token)
-
-        if resp.status != 200:
-            raise ValueError(f"Modeus вернул статус {resp.status}")
-
-        payload = await resp.json(content_type=None)
-        logger.info("Modeus events response received successfully")
-        self.last_modeus_session = {
-            "access_token": token,
-            "person_id": person_id,
-            "token_exp": exp,
-        }
-        return self.parse_modeus_schedule_json(payload)
-
-    async def _ensure_modeus_auth(
-        self,
-        login: str,
-        password: Optional[str],
-        force_refresh: bool = False,
-        preferred_session: Optional[dict[str, Any]] = None,
-    ) -> tuple[str, str, int]:
-        cache_key = login.strip().lower()
-        now_ts = datetime.now(timezone.utc).timestamp()
-        if not force_refresh and preferred_session:
-            token = preferred_session.get("access_token")
-            person_id = preferred_session.get("person_id")
-            exp = int(preferred_session.get("token_exp") or 0)
-            if token and person_id and exp - 120 > now_ts and self._looks_like_jwt(token):
-                logger.info("Using persisted Modeus session from DB for %s", cache_key)
-                self._modeus_token_cache[cache_key] = {
-                    "token": token,
-                    "person_id": person_id,
-                    "exp": exp,
-                }
-                return token, person_id, exp
-
-        cached = self._modeus_token_cache.get(cache_key)
-        if cached and not force_refresh and (cached["exp"] - 120 > now_ts):
-            logger.info("Modeus token cache hit for user %s", cache_key)
-            return cached["token"], cached["person_id"], cached["exp"]
-
-        if self.__class__._modeus_auth_lock is None:
-            self.__class__._modeus_auth_lock = asyncio.Lock()
-
-        async with self.__class__._modeus_auth_lock:
-            cached = self._modeus_token_cache.get(cache_key)
-            if cached and not force_refresh and (cached["exp"] - 120 > now_ts):
-                logger.info("Modeus token cache hit after lock for user %s", cache_key)
-                return cached["token"], cached["person_id"], cached["exp"]
-
-            if not password:
-                raise ValueError("Сессия истекла. Для продолжения заново авторизуйся через «🔐 Авторизоваться».")
-            logger.info("Refreshing Modeus token for user %s", cache_key)
-            token = await asyncio.to_thread(self._login_modeus_and_capture_token, login, password)
-            claims = self._decode_jwt_payload(token)
-            person_id = claims.get("person_id") or claims.get("sub")
-            exp = int(claims.get("exp", 0))
-            if not person_id or not exp:
-                raise ValueError("Не удалось прочитать person_id/exp из Modeus токена")
-
-            self._modeus_token_cache[cache_key] = {
-                "token": token,
-                "person_id": person_id,
-                "exp": exp,
-            }
-            return token, person_id, exp
-
-    async def bootstrap_modeus_session(self, login: str, password: str) -> dict[str, Any]:
-        token, person_id, exp = await self._ensure_modeus_auth(login, password, force_refresh=True)
-        return {
-            "access_token": token,
-            "person_id": person_id,
-            "token_exp": exp,
-        }
-
-    def _login_modeus_and_capture_token(self, login: str, password: str) -> str:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
-
-        captured_jwt_token: Optional[str] = None
-        proxy_settings = self._build_playwright_proxy_settings()
-
-        def capture_auth_header(request):
-            nonlocal captured_jwt_token
-            auth = request.headers.get("authorization")
-            if auth and auth.lower().startswith("bearer "):
-                token = auth.split(" ", 1)[1]
-                if self._looks_like_jwt(token):
-                    captured_jwt_token = token
-
-        with sync_playwright() as p:
-            try:
-                # Prefer system Chrome so we do not depend on downloaded Playwright binaries.
-                browser = p.chromium.launch(
-                    channel="chrome",
-                    headless=True,
-                    proxy=proxy_settings,
-                )
-            except PlaywrightError:
-                # Fallback to bundled chromium if it is available.
-                browser = p.chromium.launch(
-                    headless=True,
-                    proxy=proxy_settings,
-                )
-            context = browser.new_context()
-            page = context.new_page()
-            page.on("request", capture_auth_header)
-            try:
-                page.goto(MODEUS_SCHEDULE_URL, wait_until="load", timeout=90000)
-                logger.info("Modeus auth open URL: %s", page.url)
-
-                if "sso.urfu.ru" not in page.url:
-                    try:
-                        page.wait_for_url("**sso.urfu.ru/**", timeout=30000)
-                        logger.info("Modeus auth redirected to SSO: %s", page.url)
-                    except PlaywrightTimeoutError:
-                        logger.info("SSO redirect not observed in 30s, current URL: %s", page.url)
-
-                if "sso.urfu.ru" in page.url:
-                    page.get_by_role("textbox", name="Учетная запись пользователя").fill(login)
-                    page.get_by_role("textbox", name="Пароль").fill(password)
-                    page.get_by_role("button", name="Вход").click()
-                    logger.info("Credentials submitted to SSO")
-                    page.wait_for_timeout(2500)
-                    if "sso.urfu.ru" in page.url:
-                        if page.get_by_text("Неверный идентификатор пользователя или пароль").count() > 0:
-                            raise ValueError("Неверный логин или пароль УрФУ")
-                    logger.info("Still on SSO after submit, waiting for redirect")
-
-                page.wait_for_url("**urfu.modeus.org/schedule-calendar/my**", timeout=90000)
-                logger.info("Returned to Modeus after SSO")
-                page.wait_for_timeout(4000)
-            except PlaywrightTimeoutError as exc:
-                raise ValueError("Таймаут авторизации в Modeus") from exc
-            finally:
-                current_url = page.url
-                browser.close()
-
-        fragment = parse_qs(urlparse(current_url).fragment)
-        fragment_access_token = fragment.get("access_token", [None])[0]
-        fragment_id_token = fragment.get("id_token", [None])[0]
-
-        captured_token = (
-            captured_jwt_token
-            or (fragment_id_token if self._looks_like_jwt(fragment_id_token) else None)
-            or (fragment_access_token if self._looks_like_jwt(fragment_access_token) else None)
-        )
-        if captured_token:
-            logger.info("Modeus token captured successfully")
-            return captured_token
-
-        if fragment_access_token:
-            logger.error("Modeus access_token exists but is not JWT")
-            raise ValueError("Modeus вернул access_token не в JWT-формате")
-
-        if fragment_id_token:
-            logger.error("Modeus id_token exists but is not JWT")
-            raise ValueError("Modeus вернул id_token не в JWT-формате")
-
-        if not captured_jwt_token:
-            raise ValueError("Не удалось получить access token Modeus")
-        return captured_jwt_token
-
-    def _build_playwright_proxy_settings(self) -> Optional[dict[str, str]]:
-        proxy = PLAYWRIGHT_PROXY_URL.strip()
-        if not proxy:
-            return None
-        parsed = urlparse(proxy)
-        if not parsed.scheme or not parsed.hostname:
-            logger.warning("PLAYWRIGHT proxy URL is invalid: %s", proxy)
-            return None
-        settings: dict[str, str] = {
-            "server": f"{parsed.scheme}://{parsed.hostname}{f':{parsed.port}' if parsed.port else ''}"
-        }
-        if parsed.username:
-            settings["username"] = unquote(parsed.username)
-        if parsed.password:
-            settings["password"] = unquote(parsed.password)
-        return settings
-
-    def _decode_jwt_payload(self, token: str) -> dict[str, Any]:
-        parts = token.split(".")
-        if len(parts) < 2:
-            raise ValueError("Некорректный JWT токен")
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        try:
-            payload_raw = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
-            return json.loads(payload_raw)
-        except Exception as exc:
-            raise ValueError("Не удалось декодировать JWT payload") from exc
-
-    def _looks_like_jwt(self, token: Optional[str]) -> bool:
-        if not token:
-            return False
-        return token.count(".") == 2
-
-    def _modeus_week_range_utc(self, week_offset: int) -> tuple[str, str]:
-        monday, _ = self._week_range(week_offset)
-        start_local = datetime.combine(monday, time(0, 0), tzinfo=TIMEZONE)
-        end_local = start_local + timedelta(days=7)
-        start_utc = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_utc = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return start_utc, end_utc
+    def _filter_schedule_by_period(self, schedule: dict, monday, sunday) -> dict:
+        filtered = {"online": [], "offline": []}
+        for bucket in ("offline", "online"):
+            for lesson in schedule.get(bucket, []):
+                try:
+                    lesson_date = parse_russian_date(lesson["date"]).date()
+                except Exception:
+                    continue
+                if monday <= lesson_date <= sunday:
+                    filtered[bucket].append(lesson)
+        return filtered
 
     def get_week_timestamp(self, offset=0):
         now = datetime.now()
@@ -822,180 +934,6 @@ class UrfuScheduleClient:
 
         return lessons_lists
 
-    def parse_modeus_schedule_json(self, data: dict[str, Any]) -> dict:
-        lessons_lists = {"online": [], "offline": []}
-        embedded = data.get("_embedded", {})
-        events = embedded.get("events", [])
-
-        persons_by_href = {}
-        for person in embedded.get("persons", []):
-            href = (person.get("_links", {}).get("self", {}) or {}).get("href")
-            if href:
-                persons_by_href[href] = person.get("fullName", "Не указано")
-
-        attendees_by_event = {}
-        for attendee in embedded.get("event-attendees", []):
-            if attendee.get("roleId") != "TEACH":
-                continue
-            event_href = (attendee.get("_links", {}).get("event", {}) or {}).get("href")
-            person_href = (attendee.get("_links", {}).get("person", {}) or {}).get("href")
-            if not event_href or not person_href:
-                continue
-            attendees_by_event.setdefault(event_href, []).append(persons_by_href.get(person_href, "Не указано"))
-
-        event_locations_by_event_id = {
-            location.get("eventId"): location
-            for location in embedded.get("event-locations", [])
-            if location.get("eventId")
-        }
-        event_rooms_by_href = {
-            (item.get("_links", {}).get("self", {}) or {}).get("href"): item
-            for item in embedded.get("event-rooms", [])
-            if (item.get("_links", {}).get("self", {}) or {}).get("href")
-        }
-        rooms_by_href = {
-            (room.get("_links", {}).get("self", {}) or {}).get("href"): room
-            for room in embedded.get("rooms", [])
-            if (room.get("_links", {}).get("self", {}) or {}).get("href")
-        }
-        course_name_by_href = {}
-        for course_unit in embedded.get("course-unit-realizations", []):
-            href = (course_unit.get("_links", {}).get("self", {}) or {}).get("href")
-            if not href:
-                continue
-            course_name_by_href[href] = (
-                course_unit.get("nameShort")
-                or course_unit.get("name")
-                or "Без названия"
-            )
-
-        cycle_course_name_by_href = {}
-        lesson_team_cycle_ref_by_href = {}
-        for cycle in embedded.get("cycle-realizations", []):
-            cycle_href = (cycle.get("_links", {}).get("self", {}) or {}).get("href")
-            course_href = (cycle.get("_links", {}).get("course-unit-realization", {}) or {}).get("href")
-            course_name = (
-                cycle.get("courseUnitRealizationNameShort")
-                or course_name_by_href.get(course_href)
-            )
-            if cycle_href and course_name:
-                cycle_course_name_by_href[cycle_href] = course_name
-            cycle_id = cycle.get("id")
-            if cycle_id and course_name:
-                cycle_course_name_by_href[f"/{cycle_id}"] = course_name
-
-        for lesson_team in embedded.get("lesson-realization-teams", []):
-            team_href = (lesson_team.get("_links", {}).get("self", {}) or {}).get("href")
-            cycle_id = lesson_team.get("cycleRealizationId")
-            if team_href and cycle_id:
-                lesson_team_cycle_ref_by_href[team_href] = f"/{cycle_id}"
-
-        for event in events:
-            start_raw = event.get("start")
-            end_raw = event.get("end")
-            if not start_raw or not end_raw:
-                continue
-
-            try:
-                start_dt = datetime.fromisoformat(start_raw).astimezone(TIMEZONE)
-                end_dt = datetime.fromisoformat(end_raw).astimezone(TIMEZONE)
-            except ValueError:
-                continue
-
-            event_id = event.get("id")
-            event_href = (event.get("_links", {}).get("self", {}) or {}).get("href")
-            location = event_locations_by_event_id.get(event_id, {})
-
-            place = location.get("customLocation") or "Не указано"
-            event_room_href = (location.get("_links", {}).get("event-rooms", {}) or {}).get("href")
-            if event_room_href:
-                event_room = event_rooms_by_href.get(event_room_href, {})
-                room_href = (event_room.get("_links", {}).get("room", {}) or {}).get("href")
-                room = rooms_by_href.get(room_href, {})
-                if room:
-                    building_name = (room.get("building") or {}).get("nameShort") or (room.get("building") or {}).get("name")
-                    room_name = room.get("nameShort") or room.get("name")
-                    if building_name and room_name:
-                        place = f"{building_name} / {room_name}"
-                    elif room_name:
-                        place = room_name
-
-            teachers = attendees_by_event.get(event_href, [])
-            teacher = ", ".join(sorted(set(teachers))) if teachers else "Не указано"
-            lesson_type = self._normalize_lesson_type(event.get("typeId"))
-            date_label = f"{start_dt.day} {self._month_name_ru(start_dt.month)} {start_dt.year} г."
-            date_week = self._weekday_short_ru(start_dt.weekday())
-            number_lesson = self._pair_number(start_dt.strftime("%H:%M"))
-            event_name = self._resolve_modeus_event_name(
-                event,
-                course_name_by_href=course_name_by_href,
-                cycle_course_name_by_href=cycle_course_name_by_href,
-                lesson_team_cycle_ref_by_href=lesson_team_cycle_ref_by_href,
-            )
-
-            lesson = {
-                "name": event_name,
-                "type": lesson_type,
-                "place": place,
-                "teacher": teacher,
-                "time": f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}",
-                "number_lesson": number_lesson,
-                "date": date_label,
-                "date_week": date_week,
-                "mode": "online" if is_online_place(place) else "offline",
-            }
-
-            if lesson["mode"] == "online":
-                lessons_lists["online"].append(lesson)
-            else:
-                lessons_lists["offline"].append(lesson)
-
-        return lessons_lists
-
-    def _resolve_modeus_event_name(
-        self,
-        event: dict[str, Any],
-        course_name_by_href: dict[str, str],
-        cycle_course_name_by_href: dict[str, str],
-        lesson_team_cycle_ref_by_href: dict[str, str],
-    ) -> str:
-        fallback_name = event.get("name") or event.get("nameShort") or "Без названия"
-        links = event.get("_links", {})
-        direct_course_href = (links.get("course-unit-realization", {}) or {}).get("href")
-        if direct_course_href and course_name_by_href.get(direct_course_href):
-            return course_name_by_href[direct_course_href]
-
-        cycle_href = (links.get("cycle-realization", {}) or {}).get("href")
-        if cycle_href and cycle_course_name_by_href.get(cycle_href):
-            return cycle_course_name_by_href[cycle_href]
-
-        team_href = (links.get("lesson-realization-team", {}) or {}).get("href")
-        if team_href:
-            cycle_ref = lesson_team_cycle_ref_by_href.get(team_href)
-            if cycle_ref and cycle_course_name_by_href.get(cycle_ref):
-                return cycle_course_name_by_href[cycle_ref]
-
-        if not self._is_generic_modeus_event_name(fallback_name):
-            return fallback_name
-
-        return fallback_name
-
-    def _is_generic_modeus_event_name(self, name: str) -> bool:
-        normalized = (name or "").strip().lower()
-        if not normalized:
-            return True
-
-        # Modeus often returns technical placeholders like "Практическое занятие 14".
-        generic_patterns = (
-            r"^лекция(\s+\d+)?$",
-            r"^лекционное занятие(\s+\d+)?$",
-            r"^практика(\s+\d+)?$",
-            r"^практическое занятие(\s+\d+)?$",
-            r"^семинар(\s+\d+)?$",
-            r"^лабораторное занятие(\s+\d+)?$",
-        )
-        return any(re.match(pattern, normalized) for pattern in generic_patterns)
-
     def parse_schedule_html(self, html: str) -> dict:
         from bs4 import BeautifulSoup
 
@@ -1007,13 +945,17 @@ class UrfuScheduleClient:
         blocks = soup.find_all("div", class_="training-schedule")
         seen_dates = set()
         for block in blocks:
-            date = block.find('div', class_='date').text.strip().replace('\u202f', ' ')
-            date_week = block.find('div', class_='day-on-week').text.strip().replace('\u202f', ' ')
-
-            if date_week in seen_dates:
-                break
-
-            seen_dates.add(date_week)
+            date_el = block.find('div', class_='date')
+            date_week_el = block.find('div', class_='day-on-week')
+            if not date_el or not date_week_el:
+                continue
+            date = date_el.text.strip().replace('\u202f', ' ')
+            date_week = date_week_el.text.strip().replace('\u202f', ' ')
+            if not re.search(r"\d{1,2}\s+\S+\s+\d{4}", date):
+                continue
+            if date in seen_dates:
+                continue
+            seen_dates.add(date)
 
             lessons = block.find_all("tr", class_="inner-container")
 
@@ -1033,18 +975,14 @@ class UrfuScheduleClient:
                     if "Преподаватель" in info:
                         teacher_lesson = info.replace("Преподаватель:", "").strip()
 
-                    elif "Лекции" in info:
-                        type_lesson = 'Лекция'
-                    elif "Практические" in info:
-                        type_lesson = 'Практика'
-                    elif "Лабораторные" in info:
-                        type_lesson = 'Лаба'
-
-                    elif 'Х' in info or "Мира" in info or "Р" in info:
+                    elif self._looks_like_schedule_place(info):
                         place_lesson = info
 
-                    elif "https://" in info:
-                        place_lesson = info
+                    elif self._looks_like_schedule_type(info):
+                        type_lesson = self._normalize_istudent_lesson_type(info)
+
+                    elif type_lesson == "Не указано":
+                        type_lesson = info
 
                 time_lesson = lesson.find('td', class_='time').text.strip()
 
@@ -1081,18 +1019,14 @@ class UrfuScheduleClient:
                         if "Преподаватель" in info:
                             teacher_lesson = info.replace("Преподаватель:", "").strip()
 
-                        elif "Лекции" in info:
-                            type_lesson = 'Лекция'
-                        elif "Практические" in info:
-                            type_lesson = 'Практика'
-                        elif "Лабораторные" in info:
-                            type_lesson = 'Лаба'
-
-                        elif 'Х' in info or "Мира" in info or "Р" in info or "место проведения" in info:
+                        elif self._looks_like_schedule_place(info):
                             place_lesson = info
 
-                        elif "https://" in info:
-                            place_lesson = info
+                        elif self._looks_like_schedule_type(info):
+                            type_lesson = self._normalize_istudent_lesson_type(info)
+
+                        elif type_lesson == "Не указано":
+                            type_lesson = info
                         else:
                             dop_info += info + '\n'
                     lesson_info = {
@@ -1108,6 +1042,248 @@ class UrfuScheduleClient:
                     }
                     lessons_lists['online'].append(lesson_info)
         return lessons_lists
+
+    def _looks_like_schedule_place(self, value: str) -> bool:
+        normalized = (value or "").strip().lower()
+        if not normalized:
+            return False
+        place_markers = (
+            "http://",
+            "https://",
+            "teams.microsoft.com",
+            "zoom.us",
+            "meet.google.com",
+            "мира",
+            "тургенева",
+            "куйбышева",
+            "софьи ковалевской",
+            "комсомольская",
+            "малышева",
+            "ленина",
+            "ауд",
+            "место проведения",
+            "гибридный формат",
+        )
+        if any(marker in normalized for marker in place_markers):
+            return True
+        return bool(re.search(r"\b[рх]\s*\d", normalized))
+
+    def _looks_like_schedule_type(self, value: str) -> bool:
+        normalized = (value or "").strip().lower()
+        if not normalized:
+            return False
+        type_markers = (
+            "лекц",
+            "практ",
+            "лаборатор",
+            "семинар",
+            "зачет",
+            "зачёт",
+            "экзамен",
+            "консультац",
+            "аттеста",
+            "курсов",
+        )
+        return any(marker in normalized for marker in type_markers)
+
+    def _normalize_istudent_lesson_type(self, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if "лекц" in normalized:
+            return "Лекция"
+        if "лаборатор" in normalized:
+            return "Лаба"
+        if "практ" in normalized or "семинар" in normalized:
+            return "Практика"
+        if "консультац" in normalized:
+            return "Консультация"
+        if "аттеста" in normalized:
+            return "Аттестация"
+        if "экзамен" in normalized:
+            return "Экзамен"
+        if "зач" in normalized:
+            return "Зачет"
+        return self._normalize_text(value)
+
+    def parse_brs_html(self, payload: str) -> BrsReport:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(payload, "html.parser")
+        if not soup.select(".discipline") and not soup.select("#year-select"):
+            raise ValueError("Не удалось найти данные БРС на странице iStudent")
+
+        years = self._parse_brs_options(soup, "#year-select", "year")
+        semesters = self._parse_brs_options(soup, "#semester-select", "semester")
+        current_year = next((item for item in years if item.selected), None)
+        current_semester = next((item for item in semesters if item.selected), None)
+        group_option = soup.select_one("#group-select option[selected]") or soup.select_one("#group-select option")
+        program = soup.select_one(".education-service-info")
+
+        disciplines: list[BrsDiscipline] = []
+        for discipline in soup.select(".discipline"):
+            classes = set(discipline.get("class", []))
+            parent_classes = set((discipline.parent or {}).get("class", []))
+            header = discipline.select_one(".discipline-header")
+            if not header:
+                continue
+
+            name_cell = header.select_one(".td-0")
+            if not name_cell:
+                continue
+            mobile_mark = name_cell.select_one(".mobile-discipline-mark")
+            if mobile_mark:
+                mobile_mark.extract()
+
+            name = self._normalize_text(name_cell.get_text(" ", strip=True))
+            score_cell = header.select_one(".td-1")
+            grade_cell = header.select_one(".td-2")
+            score = self._normalize_text(score_cell.get_text(" ", strip=True) if score_cell else "")
+            grade = self._normalize_text(grade_cell.get_text(" ", strip=True) if grade_cell else "")
+            if not name:
+                continue
+
+            disciplines.append(
+                BrsDiscipline(
+                    discipline_id=str(discipline.get("data-id") or "").strip(),
+                    name=name,
+                    score=score or "—",
+                    grade=grade or "—",
+                    is_selected="not-selected" not in classes,
+                    is_actual="not-actual" not in classes,
+                    is_visible_by_default="hidden" not in parent_classes,
+                    survey_required=bool(discipline.select_one(".survey-flag")),
+                )
+            )
+
+        return BrsReport(
+            group_title=self._normalize_text(group_option.get_text(" ", strip=True)) if group_option else "",
+            program_title=self._normalize_text(program.get_text(" ", strip=True)) if program else "",
+            current_year=current_year.value if current_year else "",
+            current_year_label=current_year.label if current_year else "",
+            current_semester=current_semester.value if current_semester else "",
+            current_semester_label=current_semester.label if current_semester else "",
+            years=years,
+            semesters=semesters,
+            disciplines=disciplines,
+        )
+
+    def _parse_brs_options(self, soup, selector: str, query_key: str) -> list[BrsOption]:
+        options: list[BrsOption] = []
+        for option in soup.select(f"{selector} option"):
+            raw_url = option.get("value") or ""
+            parsed = urlparse(raw_url)
+            query = parse_qs(parsed.query)
+            value = (query.get(query_key) or [""])[0]
+            label = self._normalize_text(option.get_text(" ", strip=True))
+            if label:
+                options.append(
+                    BrsOption(
+                        value=value,
+                        label=label,
+                        selected=option.has_attr("selected"),
+                    )
+                )
+        return options
+
+    def parse_brs_discipline_detail_html(
+        self,
+        payload: str,
+        discipline: BrsDiscipline,
+    ) -> BrsDisciplineDetail:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(payload, "html.parser")
+        if not soup.select(".discipline-detail") and not soup.select(".discipline-mark"):
+            raise ValueError("Не удалось найти детализацию дисциплины БРС")
+
+        teachers: list[str] = []
+        sections: list[BrsDetailSection] = []
+        score = discipline.score
+        site_grade = discipline.grade
+
+        mark = soup.select_one(".discipline-mark")
+        if mark:
+            mark_texts = [
+                self._normalize_text(item.get_text(" ", strip=True))
+                for item in mark.select("p")
+            ]
+            for item in mark_texts:
+                lower = item.lower()
+                if lower.startswith("оценка:"):
+                    site_grade = self._normalize_text(item.split(":", 1)[1])
+                elif lower.startswith("балл:"):
+                    score = self._normalize_text(item.split(":", 1)[1])
+
+        for detail in soup.select(".discipline-detail"):
+            header = detail.select_one(".discipline-detail-header")
+            title, expression = self._parse_brs_detail_header(header)
+            if not title:
+                continue
+
+            if title.lower().startswith("преподаватели"):
+                teachers = [
+                    self._normalize_text(item.get_text(" ", strip=True))
+                    for item in detail.select(".list .detail-inline-block")
+                    if self._normalize_text(item.get_text(" ", strip=True))
+                ]
+                continue
+
+            attestations: list[BrsDetailAttestation] = []
+            for attestation in detail.select(".discipline-attestation"):
+                att_title, att_expression = self._parse_brs_detail_header(
+                    attestation.select_one(".discipline-attestation-header")
+                )
+                controls = [
+                    self._normalize_text(item.get_text(" ", strip=True))
+                    for item in attestation.select(".discipline-controls p")
+                    if self._normalize_text(item.get_text(" ", strip=True))
+                ]
+                if att_title or att_expression or controls:
+                    attestations.append(
+                        BrsDetailAttestation(
+                            title=att_title,
+                            expression=att_expression,
+                            controls=controls,
+                        )
+                    )
+
+            sections.append(
+                BrsDetailSection(
+                    title=title,
+                    expression=expression,
+                    attestations=attestations,
+                )
+            )
+
+        return BrsDisciplineDetail(
+            discipline_id=discipline.discipline_id,
+            name=discipline.name,
+            score=score or discipline.score,
+            site_grade=site_grade or discipline.grade,
+            teachers=teachers,
+            sections=sections,
+        )
+
+    def _parse_brs_detail_header(self, header) -> tuple[str, str]:
+        if not header:
+            return "", ""
+        from bs4 import BeautifulSoup
+
+        expression_el = header.select_one(".score-expression-desktop") or header.select_one(".score-expression-mobile")
+        expression = self._normalize_text(expression_el.get_text(" ", strip=True)) if expression_el else ""
+
+        title_el = header.find("span", recursive=False)
+        if not title_el:
+            raw = self._normalize_text(header.get_text(" ", strip=True))
+            return raw, expression
+
+        title_soup = BeautifulSoup(str(title_el), "html.parser")
+        for item in title_soup.select(".mobile-factor"):
+            item.decompose()
+        title = self._normalize_text(title_soup.get_text(" ", strip=True)).rstrip(":")
+        return title, expression
+
+    def _normalize_text(self, value: str) -> str:
+        return " ".join((value or "").replace("\xa0", " ").split())
 
     def _normalize_lesson_type(self, type_code: Optional[str]) -> str:
         if not type_code:
@@ -1165,11 +1341,12 @@ class UrfuScheduleClient:
 def main_menu_kb(is_authorized: bool):
     builder = InlineKeyboardBuilder()
     builder.button(text="📅 Сегодня", callback_data="menu:today")
-    builder.button(text="🗓 Выбрать неделю", callback_data="menu:week:choose")
+    builder.button(text="🗓 Неделя", callback_data="menu:week:choose")
+    builder.button(text="📊 Баллы БРС", callback_data="menu:brs")
     builder.button(text="⏰ Напоминания", callback_data="menu:reminders")
-    auth_text = "🔐 Профиль и сессия" if is_authorized else "🔐 Авторизоваться"
+    auth_text = "🔐 Профиль" if is_authorized else "🔐 Авторизоваться"
     builder.button(text=auth_text, callback_data="menu:auth")
-    builder.adjust(1, 1, 1, 1)
+    builder.adjust(1, 1, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -1214,11 +1391,16 @@ def day_select_kb(week_offset: int):
 
 def day_nav_kb(day_offset: int):
     builder = InlineKeyboardBuilder()
+    target_date = datetime.now(TIMEZONE).date() + timedelta(days=day_offset)
+    current_monday = datetime.now(TIMEZONE).date() - timedelta(days=datetime.now(TIMEZONE).date().weekday())
+    target_monday = target_date - timedelta(days=target_date.weekday())
+    week_offset = (target_monday - current_monday).days // 7
     builder.button(text="⬅️ Пред.", callback_data=f"today:offset:{day_offset - 1}")
     builder.button(text="📅 Сегодня", callback_data="today:offset:0")
     builder.button(text="След. ➡️", callback_data=f"today:offset:{day_offset + 1}")
+    builder.button(text="🗓 Дни недели", callback_data=f"menu:week:{week_offset}")
     builder.button(text="🏠 Меню", callback_data="menu:home")
-    builder.adjust(3, 1)
+    builder.adjust(3, 1, 1)
     return builder.as_markup()
 
 
@@ -1235,6 +1417,97 @@ def reminders_kb(enabled: bool, days: set[int]):
     return builder.as_markup()
 
 
+def brs_report_kb(report: BrsReport, include_hidden: bool):
+    builder = InlineKeyboardBuilder()
+    year = brs_callback_value(report.current_year)
+    semester = brs_callback_value(report.current_semester)
+    mode = "actual"
+
+    builder.button(
+        text=f"📅 Год: {report.current_year_label or 'выбрать'}",
+        callback_data=f"brs:years:{year}:{semester}:{mode}",
+    )
+    builder.button(
+        text=f"🌓 Семестр: {report.current_semester_label or 'выбрать'}",
+        callback_data=f"brs:semesters:{year}:{semester}:{mode}",
+    )
+    builder.button(text="📚 Предметы подробно", callback_data=f"brs:list:{year}:{semester}:{mode}")
+    builder.button(text="🔄 Обновить из УрФУ", callback_data=f"brs:refresh:{year}:{semester}:{mode}")
+    builder.button(text="🏠 Меню", callback_data="menu:home")
+    builder.adjust(1, 1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def brs_year_select_kb(report: BrsReport, include_hidden: bool):
+    builder = InlineKeyboardBuilder()
+    semester = brs_callback_value(report.current_semester)
+    mode = "actual"
+    for option in report.years:
+        mark = "✅ " if option.selected else ""
+        builder.button(
+            text=f"{mark}{option.label}",
+            callback_data=f"brs:show:{brs_callback_value(option.value)}:{semester}:{mode}",
+        )
+    builder.button(
+        text="⬅️ Назад",
+        callback_data=f"brs:show:{brs_callback_value(report.current_year)}:{semester}:{mode}",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def brs_semester_select_kb_values(year: Optional[str], semester: Optional[str]):
+    builder = InlineKeyboardBuilder()
+    year_value = brs_callback_value(year)
+    current_semester = brs_callback_value(semester)
+    for value, label in (("autumn", "Осенний"), ("spring", "Весенний")):
+        mark = "✅ " if value == current_semester else ""
+        builder.button(
+            text=f"{mark}{label}",
+            callback_data=f"brs:show:{year_value}:{value}:actual",
+        )
+    builder.button(
+        text="⬅️ Назад",
+        callback_data=f"brs:show:{year_value}:{current_semester}:actual",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def active_brs_disciplines(report: BrsReport) -> list[BrsDiscipline]:
+    return [
+        item for item in report.disciplines
+        if item.is_visible_by_default and item.is_actual and item.is_selected
+    ]
+
+
+def brs_subject_select_kb(report: BrsReport):
+    builder = InlineKeyboardBuilder()
+    year = brs_callback_value(report.current_year)
+    semester = brs_callback_value(report.current_semester)
+    for idx, discipline in enumerate(active_brs_disciplines(report), start=1):
+        score = discipline.score or "—"
+        builder.button(
+            text=f"{idx}. {shorten_text(discipline.name, 42)} · {score}",
+            callback_data=f"brsd:show:{year}:{semester}:{discipline.discipline_id}",
+        )
+    builder.button(text="⬅️ К БРС", callback_data=f"brs:show:{year}:{semester}:actual")
+    builder.button(text="🏠 Меню", callback_data="menu:home")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def brs_detail_kb(year: Optional[str], semester: Optional[str]):
+    builder = InlineKeyboardBuilder()
+    year_value = brs_callback_value(year)
+    semester_value = brs_callback_value(semester)
+    builder.button(text="📚 Все предметы", callback_data=f"brs:list:{year_value}:{semester_value}:actual")
+    builder.button(text="⬅️ К БРС", callback_data=f"brs:show:{year_value}:{semester_value}:actual")
+    builder.button(text="🏠 Меню", callback_data="menu:home")
+    builder.adjust(1, 1, 1)
+    return builder.as_markup()
+
+
 def auth_profile_kb():
     builder = InlineKeyboardBuilder()
     builder.button(text="🔁 Сменить аккаунт УрФУ", callback_data="auth:change")
@@ -1245,7 +1518,7 @@ def auth_profile_kb():
 
 def reply_schedule_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📅 Расписание")]],
+        keyboard=[[KeyboardButton(text="📅 Расписание"), KeyboardButton(text="📊 БРС")]],
         resize_keyboard=True,
         input_field_placeholder="Быстрый доступ",
     )
@@ -1319,6 +1592,109 @@ def is_online_place(place: str) -> bool:
     )
     return any(marker in normalized for marker in online_markers)
 
+
+def brs_callback_value(value: Optional[str]) -> str:
+    return (value or "0").strip() or "0"
+
+
+def brs_semester_label(value: Optional[str]) -> str:
+    labels = {
+        "autumn": "Осенний",
+        "spring": "Весенний",
+    }
+    return labels.get((value or "").strip(), "семестр")
+
+
+def brs_year_label(value: Optional[str]) -> str:
+    try:
+        year = int((value or "").strip())
+        return f"{year}/{year + 1}"
+    except ValueError:
+        return "учебный год"
+
+
+def brs_loading_text(year: Optional[str] = None, semester: Optional[str] = None, force_refresh: bool = False) -> str:
+    if not year or not semester:
+        year, semester = current_brs_period()
+    action = "Обновляю данные из УрФУ" if force_refresh else "Загружаю БРС"
+    source = "Если недавно открывал, покажу из кэша." if not force_refresh else "Это может занять несколько секунд."
+    return (
+        f"📊 <b>{action}...</b>\n\n"
+        f"🗓 {html.escape(brs_year_label(year))} · {html.escape(brs_semester_label(semester))}\n"
+        f"⏳ {source}"
+    )
+
+
+def schedule_loading_text(title: str, detail: str) -> str:
+    return (
+        f"🗓 <b>{html.escape(title)}...</b>\n\n"
+        f"{html.escape(detail)}\n"
+        "⏳ Загружаю расписание. Если оно уже открывалось, покажу из кэша."
+    )
+
+
+def brs_decode_callback_value(value: str) -> Optional[str]:
+    value = (value or "").strip()
+    return None if not value or value == "0" else value
+
+
+def brs_mode_value(include_hidden: bool) -> str:
+    return "all" if include_hidden else "actual"
+
+
+def brs_mode_is_all(value: str) -> bool:
+    return value == "all"
+
+
+def shorten_text(value: str, limit: int = 96) -> str:
+    value = " ".join((value or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def parse_brs_score(score: str) -> Optional[float]:
+    try:
+        normalized = (score or "").replace(",", ".").strip()
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def brs_score_grade(score: str) -> tuple[str, str]:
+    value = parse_brs_score(score)
+    if value is None:
+        return "Нет данных", "📌"
+    if value < 40:
+        return "Неудовлетворительно", "🔴"
+    if value < 60:
+        return "Удовлетворительно", "🟡"
+    if value < 80:
+        return "Хорошо", "🟢"
+    return "Отлично", "🏆"
+
+
+def brs_score_bar(score: str) -> str:
+    value = parse_brs_score(score)
+    if value is None:
+        return "▫️" * 10
+    filled = max(0, min(10, round(value / 10)))
+    return "🟩" * filled + "⬜" * (10 - filled)
+
+
+def brs_is_pending_result(score: str, grade: str) -> bool:
+    value = parse_brs_score(score)
+    normalized_grade = (grade or "").strip().lower()
+    return (
+        value == 0
+        and (
+            "отсутств" in normalized_grade
+            or "незач" in normalized_grade
+            or "неуд" in normalized_grade
+        )
+    )
+
+
 def format_lessons(title, lessons) -> str:
     if not lessons or (not lessons.get("offline") and not lessons.get("online")):
         return f"<b>{title}</b>\n\nПар нет 🎉"
@@ -1356,6 +1732,125 @@ def format_lessons(title, lessons) -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def format_brs_report(report: BrsReport, include_hidden: bool = False) -> str:
+    visible_disciplines = active_brs_disciplines(report)
+    semester_number = estimate_semester_number(
+        report.group_title,
+        report.current_year_label,
+        report.current_semester,
+    )
+    semester_title = (
+        f"{semester_number} семестр"
+        if semester_number
+        else report.current_semester_label or "семестр"
+    )
+
+    lines = [
+        f"📊 <b>БРС · {html.escape(semester_title)}</b>",
+        "",
+        f"🎓 <b>{html.escape(report.group_title or '—')}</b>",
+        f"🗓 {html.escape(report.current_year_label or '—')} · {html.escape(report.current_semester_label or '—')}",
+    ]
+    if report.program_title:
+        lines.append(f"📚 {html.escape(report.program_title)}")
+    lines.append("✅ Только актуальные дисциплины")
+    lines.append("📐 Оценка рассчитана по баллам")
+    lines.append("")
+
+    if not visible_disciplines:
+        lines.append("По текущему семестру баллы пока не найдены.")
+        return "\n".join(lines).strip()
+
+    for idx, discipline in enumerate(visible_disciplines, start=1):
+        name = html.escape(shorten_text(discipline.name, limit=110))
+        score = html.escape(discipline.score or "—")
+        grade, grade_icon = brs_score_grade(discipline.score)
+        grade = html.escape(grade)
+        is_pending = brs_is_pending_result(discipline.score, discipline.grade)
+        survey_line = "\n🧾 Нужно заполнить анкету" if discipline.survey_required else ""
+        pending_label = " · в процессе" if is_pending else ""
+        lines.append(
+            f"{idx}. <b>{name}</b>\n"
+            f"<b>{score}</b>/100 · {grade_icon} <b>{grade}</b>{pending_label}\n"
+            f"{brs_score_bar(discipline.score)}"
+            f"{survey_line}"
+        )
+        lines.append("")
+
+    text = "\n".join(lines).strip()
+    if len(text) <= 3900:
+        return text
+
+    trimmed = lines[:6]
+    for line in lines[6:]:
+        candidate = "\n".join([*trimmed, line, "\nСписок сокращен: сообщение Telegram слишком длинное."])
+        if len(candidate) > 3900:
+            break
+        trimmed.append(line)
+    trimmed.append("\nСписок сокращен: сообщение Telegram слишком длинное.")
+    return "\n".join(trimmed).strip()
+
+
+def format_brs_subject_list(report: BrsReport) -> str:
+    disciplines = active_brs_disciplines(report)
+    semester_number = estimate_semester_number(
+        report.group_title,
+        report.current_year_label,
+        report.current_semester,
+    )
+    semester_title = f"{semester_number} семестр" if semester_number else report.current_semester_label or "семестр"
+    return (
+        f"📚 <b>Предметы БРС · {html.escape(semester_title)}</b>\n\n"
+        f"🗓 {html.escape(report.current_year_label or '—')} · {html.escape(report.current_semester_label or '—')}\n"
+        f"Выбери предмет, чтобы посмотреть детализацию баллов.\n\n"
+        f"Доступно предметов: <b>{len(disciplines)}</b>"
+    )
+
+
+def format_brs_detail(detail: BrsDisciplineDetail, report: BrsReport) -> str:
+    grade, grade_icon = brs_score_grade(detail.score)
+    lines = [
+        f"📘 <b>{html.escape(shorten_text(detail.name, 120))}</b>",
+        f"🗓 {html.escape(report.current_year_label or '—')} · {html.escape(report.current_semester_label or '—')}",
+        "",
+        f"<b>{html.escape(detail.score or '—')}</b>/100 · {grade_icon} <b>{html.escape(grade)}</b>",
+        brs_score_bar(detail.score),
+    ]
+
+    if detail.teachers:
+        lines.extend(["", "👨‍🏫 <b>Преподаватели</b>"])
+        lines.extend(f"• {html.escape(teacher)}" for teacher in detail.teachers)
+
+    if detail.sections:
+        lines.append("")
+
+    for section in detail.sections:
+        lines.append(f"<b>{html.escape(section.title)}</b>")
+        if section.expression:
+            lines.append(f"Итог блока: {html.escape(section.expression)}")
+        for attestation in section.attestations:
+            attestation_line = f"• {html.escape(attestation.title)}"
+            if attestation.expression:
+                attestation_line += f": {html.escape(attestation.expression)}"
+            lines.append(attestation_line)
+            for control in attestation.controls:
+                lines.append(f"  - {html.escape(control)}")
+        lines.append("")
+
+    text = "\n".join(lines).strip()
+    if len(text) <= 3900:
+        return text
+
+    trimmed = lines[:8]
+    for line in lines[8:]:
+        candidate = "\n".join([*trimmed, line, "\nДетализация сокращена: сообщение Telegram слишком длинное."])
+        if len(candidate) > 3900:
+            break
+        trimmed.append(line)
+    trimmed.append("\nДетализация сокращена: сообщение Telegram слишком длинное.")
+    return "\n".join(trimmed).strip()
 
 
 async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup=None) -> None:
@@ -1540,23 +2035,167 @@ async def get_schedule_payload_for_week(telegram_id: int, week_offset: int) -> d
     return await fetch_schedule_payload_for_user(user, week_offset)
 
 
-async def fetch_schedule_payload_for_user(user: dict, week_offset: int) -> dict:
+async def get_brs_report_payload(
+    telegram_id: int,
+    year: Optional[str] = None,
+    semester: Optional[str] = None,
+    force_refresh: bool = False,
+) -> BrsReport:
+    user = await get_user(telegram_id)
+    if not user:
+        raise ValueError("Сначала авторизуйся через кнопку «🔐 Авторизоваться».")
+
+    year, semester = resolve_brs_period(year, semester)
+    cache_key = f"brs:v2:{telegram_id}:{year}:{semester}"
+    if not force_refresh:
+        cached = await get_cached_response(cache_key, BRS_CACHE_TTL_SECONDS)
+        if cached:
+            logger.info("BRS cache hit for user=%s year=%s semester=%s", telegram_id, year, semester)
+            return brs_report_from_dict(cached)
+
+    login = (user.get("urfu_login") or "").strip()
     decrypted_password = decrypt_password(user.get("urfu_password"))
-    async with UrfuScheduleClient() as client:
-        lessons = await client.fetch_week_schedule(
-            user["urfu_login"],
-            decrypted_password,
-            week_offset=week_offset,
-            persisted_modeus_session=get_persisted_modeus_session(user),
-        )
-        if client.last_modeus_session:
-            await save_modeus_session(
-                user["telegram_id"],
-                client.last_modeus_session["access_token"],
-                client.last_modeus_session["person_id"],
-                client.last_modeus_session["token_exp"],
-            )
-        return lessons
+    if not login or not decrypted_password:
+        raise ValueError("Для БРС нужен сохраненный пароль. Заново авторизуйся через «🔐 Авторизоваться».")
+
+    async with get_cache_lock(cache_key):
+        if not force_refresh:
+            cached = await get_cached_response(cache_key, BRS_CACHE_TTL_SECONDS)
+            if cached:
+                logger.info("BRS cache hit after lock for user=%s year=%s semester=%s", telegram_id, year, semester)
+                return brs_report_from_dict(cached)
+
+        try:
+            async with UrfuScheduleClient() as client:
+                report = await client.fetch_brs_report(
+                    login,
+                    decrypted_password,
+                    year=year,
+                    semester=semester,
+                )
+            await set_cached_response(cache_key, brs_report_to_dict(report))
+            return report
+        except Exception:
+            stale = await get_cached_response(cache_key, STALE_CACHE_TTL_SECONDS)
+            if stale:
+                logger.exception("BRS fetch failed, returning stale cache for user=%s", telegram_id)
+                return brs_report_from_dict(stale)
+            raise
+
+
+async def build_brs_response(
+    telegram_id: int,
+    year: Optional[str] = None,
+    semester: Optional[str] = None,
+    include_hidden: bool = False,
+    force_refresh: bool = False,
+) -> tuple[str, Any, BrsReport]:
+    report = await get_brs_report_payload(
+        telegram_id,
+        year=year,
+        semester=semester,
+        force_refresh=force_refresh,
+    )
+    return format_brs_report(report, include_hidden=include_hidden), brs_report_kb(report, include_hidden), report
+
+
+async def get_brs_discipline_detail_payload(
+    telegram_id: int,
+    discipline_id: str,
+    year: Optional[str] = None,
+    semester: Optional[str] = None,
+    force_refresh: bool = False,
+) -> tuple[BrsDisciplineDetail, BrsReport]:
+    year, semester = resolve_brs_period(year, semester)
+    report = await get_brs_report_payload(telegram_id, year=year, semester=semester)
+    discipline = next(
+        (
+            item for item in active_brs_disciplines(report)
+            if item.discipline_id == discipline_id
+        ),
+        None,
+    )
+    if discipline is None:
+        raise ValueError("Предмет не найден в актуальных дисциплинах БРС.")
+
+    cache_key = f"brs_detail:v1:{telegram_id}:{year}:{semester}:{discipline_id}"
+    if not force_refresh:
+        cached = await get_cached_response(cache_key, BRS_CACHE_TTL_SECONDS)
+        if cached:
+            logger.info("BRS detail cache hit for user=%s discipline=%s", telegram_id, discipline_id)
+            return brs_detail_from_dict(cached), report
+
+    user = await get_user(telegram_id)
+    if not user:
+        raise ValueError("Сначала авторизуйся через кнопку «🔐 Авторизоваться».")
+
+    login = (user.get("urfu_login") or "").strip()
+    decrypted_password = decrypt_password(user.get("urfu_password"))
+    if not login or not decrypted_password:
+        raise ValueError("Для детализации БРС нужен сохраненный пароль. Заново авторизуйся через «🔐 Авторизоваться».")
+
+    async with get_cache_lock(cache_key):
+        if not force_refresh:
+            cached = await get_cached_response(cache_key, BRS_CACHE_TTL_SECONDS)
+            if cached:
+                logger.info("BRS detail cache hit after lock for user=%s discipline=%s", telegram_id, discipline_id)
+                return brs_detail_from_dict(cached), report
+
+        try:
+            async with UrfuScheduleClient() as client:
+                detail = await client.fetch_brs_discipline_detail(
+                    login,
+                    decrypted_password,
+                    discipline,
+                    year=year,
+                    semester=semester,
+                )
+            await set_cached_response(cache_key, brs_detail_to_dict(detail))
+            return detail, report
+        except Exception:
+            stale = await get_cached_response(cache_key, STALE_CACHE_TTL_SECONDS)
+            if stale:
+                logger.exception(
+                    "BRS detail fetch failed, returning stale cache for user=%s discipline=%s",
+                    telegram_id,
+                    discipline_id,
+                )
+                return brs_detail_from_dict(stale), report
+            raise
+
+
+async def fetch_schedule_payload_for_user(user: dict, week_offset: int, force_refresh: bool = False) -> dict:
+    telegram_id = user["telegram_id"]
+    cache_key = f"schedule:v2:{telegram_id}:{week_offset}"
+    if not force_refresh:
+        cached = await get_cached_response(cache_key, SCHEDULE_CACHE_TTL_SECONDS)
+        if cached:
+            logger.info("Schedule cache hit for user=%s week_offset=%s", telegram_id, week_offset)
+            return cached
+
+    decrypted_password = decrypt_password(user.get("urfu_password"))
+    async with get_cache_lock(cache_key):
+        if not force_refresh:
+            cached = await get_cached_response(cache_key, SCHEDULE_CACHE_TTL_SECONDS)
+            if cached:
+                logger.info("Schedule cache hit after lock for user=%s week_offset=%s", telegram_id, week_offset)
+                return cached
+
+        try:
+            async with UrfuScheduleClient() as client:
+                lessons = await client.fetch_week_schedule(
+                    user["urfu_login"],
+                    decrypted_password,
+                    week_offset=week_offset,
+                )
+            await set_cached_response(cache_key, lessons)
+            return lessons
+        except Exception:
+            stale = await get_cached_response(cache_key, STALE_CACHE_TTL_SECONDS)
+            if stale:
+                logger.exception("Schedule fetch failed, returning stale cache for user=%s week_offset=%s", telegram_id, week_offset)
+                return stale
+            raise
 
 
 async def build_week_calendar_file(telegram_id: int, week_offset: int) -> tuple[str, BufferedInputFile, str]:
@@ -1577,27 +2216,27 @@ def auth_status_text(user: Optional[dict]) -> str:
         return "🔐 <b>Статус:</b> не авторизован\n\nНажми кнопку «Авторизоваться», чтобы ввести логин и пароль."
 
     login = user.get("urfu_login")
-    token_exp = user.get("modeus_token_exp")
+    has_password = bool(decrypt_password(user.get("urfu_password")))
+    if has_password:
+        return (
+            "🔐 <b>Статус:</b> авторизован ✅\n"
+            f"👤 Логин: <code>{login or '—'}</code>\n"
+            "Источник расписания: <b>iStudent УрФУ</b>\n"
+            "БРС: <b>iStudent УрФУ</b>\n"
+            "🔒 Пароль хранится только в зашифрованном виде."
+        )
+
     if not is_user_authorized(user):
         return (
             "🔐 <b>Статус:</b> частично настроено\n"
             f"👤 Логин: <code>{login or '—'}</code>\n"
-            "Сессия Modeus не активна. Нажми «Авторизоваться», чтобы обновить вход."
+            "Пароль не сохранен. Нажми «Авторизоваться», чтобы включить iStudent."
         )
 
-    try:
-        exp_dt = datetime.fromtimestamp(int(token_exp), tz=timezone.utc).astimezone(TIMEZONE)
-        exp_str = exp_dt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        exp_str = "неизвестно"
-
     return (
-        "🔐 <b>Статус:</b> авторизован ✅\n"
-        f"👤 Логин: <code>{login}</code>\n"
-        f"🆔 Person ID: <code>{user.get('modeus_person_id', '—')}</code>\n"
-        f"⏳ Сессия до: <code>{exp_str}</code>\n"
-        "🔒 Пароль хранится только в зашифрованном виде.\n"
-        "Хранится: логин + шифрованный пароль + сессия Modeus."
+        "🔐 <b>Статус:</b> частично настроено\n"
+        f"👤 Логин: <code>{login or '—'}</code>\n"
+        "Заново авторизуйся через «🔐 Авторизоваться», чтобы включить iStudent."
     )
 
 
@@ -1641,7 +2280,7 @@ async def process_login(message: Message, state: FSMContext) -> None:
     await state.set_state(AuthStates.waiting_password)
     await message.answer(
         "Теперь введи пароль от УрФУ:\n"
-        "🔒 Пароль будет зашифрован и сохранён для авто-обновления сессии.\n"
+        "🔒 Пароль будет зашифрован и сохранён для получения расписания и БРС.\n"
         "После отправки я удалю сообщение с паролем."
     )
 
@@ -1679,52 +2318,22 @@ async def process_password(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    await update_progress("🌐 Подключаю Modeus и создаю сессию...\nЭто может занять до 1-2 минут.")
-    try:
-        async with UrfuScheduleClient() as client:
-            session_data = await client.bootstrap_modeus_session(login, password)
-    except Exception as exc:
-        logger.exception("Failed to bootstrap modeus session on login")
-        error_text = str(exc).lower()
-        if "неверный логин" in error_text or "пароль" in error_text:
-            await update_progress("❌ Неверный логин или пароль.")
-        else:
-            await update_progress(
-                "❌ Не удалось получить сессию Modeus. Проверь логин/пароль и попробуй снова."
-            )
-        await state.set_state(AuthStates.waiting_login)
-        await message.answer("Введи логин от УрФУ ещё раз:")
-        return
-
-    await update_progress("✅ Сессия получена. Сохраняю логин и сессию...")
+    await update_progress("✅ Вход iStudent подтвержден. Сохраняю данные...")
     await upsert_user_credentials(message.from_user.id, login, password)
-    try:
-        await save_modeus_session(
-            message.from_user.id,
-            session_data["access_token"],
-            session_data["person_id"],
-            session_data["token_exp"],
-        )
-        logger.info("Modeus session persisted for user_id=%s", message.from_user.id)
-        await update_progress("✅ Сессия Modeus сохранена.")
-    except Exception:
-        logger.exception("Failed to persist modeus session on login")
-        await update_progress("❌ Не удалось сохранить сессию. Попробуй авторизоваться ещё раз.")
-        await state.set_state(AuthStates.waiting_login)
-        await message.answer("Введи логин от УрФУ ещё раз:")
-        return
+    await update_progress("✅ Данные сохранены. Расписание и БРС будут работать через iStudent.")
 
     await state.clear()
     _, authorized = await build_main_screen_text(message.from_user.id)
-    await message.answer("Готово! Данные сохранены.\nТеперь я смогу присылать расписание утром в 07:00.")
+    await message.answer("Готово. Теперь я смогу отправлять расписание утром.")
     await message.answer("Быстрый доступ включен 👇", reply_markup=reply_schedule_kb())
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb(authorized))
 
 
 @router.message(Command("today"))
 async def cmd_today(message: Message) -> None:
+    progress = await message.answer(schedule_loading_text("Открываю день", "Сегодня"))
     text = await get_schedule_for_day(message.from_user.id, day_offset=0)
-    await message.answer(text, reply_markup=day_nav_kb(0))
+    await progress.edit_text(text, reply_markup=day_nav_kb(0))
 
 
 @router.message(Command("week"))
@@ -1732,10 +2341,26 @@ async def cmd_week(message: Message) -> None:
     await message.answer("Выбери, какую неделю показать:", reply_markup=week_select_kb())
 
 
+@router.message(Command("brs"))
+async def cmd_brs(message: Message) -> None:
+    progress = await message.answer(brs_loading_text())
+    try:
+        text, keyboard, _ = await build_brs_response(message.from_user.id)
+        await progress.edit_text(text, reply_markup=keyboard)
+    except Exception as exc:
+        logger.exception("Failed to get BRS")
+        await progress.edit_text(f"Не удалось получить БРС: <code>{exc}</code>")
+
+
 @router.message(F.text.in_(["📅 Расписание", "расписание", "Расписание"]))
 async def reply_schedule_home(message: Message) -> None:
     _, authorized = await build_main_screen_text(message.from_user.id)
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb(authorized))
+
+
+@router.message(F.text.in_(["📊 БРС", "брс", "БРС"]))
+async def reply_brs(message: Message) -> None:
+    await cmd_brs(message)
 
 
 @router.message(Command("calendar"))
@@ -1758,8 +2383,147 @@ async def cb_home(callback: CallbackQuery) -> None:
 async def cb_menu_today(callback: CallbackQuery) -> None:
     logger.info("Callback menu:today from user_id=%s", callback.from_user.id)
     await acknowledge_callback(callback)
+    await safe_edit_message(callback, schedule_loading_text("Открываю день", "Сегодня"), reply_markup=None)
     text = await get_schedule_for_day(callback.from_user.id, day_offset=0)
     await safe_edit_message(callback, text, reply_markup=day_nav_kb(0))
+
+
+@router.callback_query(F.data == "menu:brs")
+async def cb_menu_brs(callback: CallbackQuery) -> None:
+    logger.info("Callback menu:brs from user_id=%s", callback.from_user.id)
+    await acknowledge_callback(callback, text="Загружаю БРС...")
+    try:
+        await safe_edit_message(callback, brs_loading_text(), reply_markup=None)
+        text, keyboard, _ = await build_brs_response(callback.from_user.id)
+        await safe_edit_message(callback, text, reply_markup=keyboard)
+    except Exception as exc:
+        logger.exception("Failed to get BRS")
+        await safe_edit_message(
+            callback,
+            f"Не удалось получить БРС: <code>{exc}</code>",
+            reply_markup=main_menu_kb(False),
+        )
+
+
+@router.callback_query(F.data.startswith("brs:"))
+async def cb_brs(callback: CallbackQuery) -> None:
+    await acknowledge_callback(callback, text="Обновляю БРС...")
+    parts = (callback.data or "").split(":")
+    if len(parts) < 5:
+        return
+
+    action = parts[1]
+    year = brs_decode_callback_value(parts[2])
+    semester = brs_decode_callback_value(parts[3])
+    include_hidden = brs_mode_is_all(parts[4])
+    force_refresh = action == "refresh"
+
+    try:
+        if action == "semesters":
+            if not year:
+                year, semester = resolve_brs_period(year, semester)
+            await safe_edit_message(
+                callback,
+                "🌓 <b>Выбери семестр БРС</b>",
+                reply_markup=brs_semester_select_kb_values(year, semester),
+            )
+            return
+
+        if action == "list":
+            await safe_edit_message(
+                callback,
+                "📚 <b>Открываю предметы...</b>\n\n⏳ Готовлю список актуальных дисциплин.",
+                reply_markup=None,
+            )
+            report = await get_brs_report_payload(
+                callback.from_user.id,
+                year=year,
+                semester=semester,
+            )
+            await safe_edit_message(
+                callback,
+                format_brs_subject_list(report),
+                reply_markup=brs_subject_select_kb(report),
+            )
+            return
+
+        loading_title = "Открываю выбор" if action in {"years", "semesters"} else None
+        if loading_title:
+            await safe_edit_message(
+                callback,
+                f"📊 <b>{loading_title}...</b>\n\n⏳ Загружаю доступные периоды БРС.",
+                reply_markup=None,
+            )
+        else:
+            await safe_edit_message(
+                callback,
+                brs_loading_text(year=year, semester=semester, force_refresh=force_refresh),
+                reply_markup=None,
+            )
+        report = await get_brs_report_payload(
+            callback.from_user.id,
+            year=year,
+            semester=semester,
+            force_refresh=force_refresh,
+        )
+        if action == "years":
+            await safe_edit_message(
+                callback,
+                "📅 <b>Выбери учебный год БРС</b>",
+                reply_markup=brs_year_select_kb(report, include_hidden),
+            )
+            return
+
+        text = format_brs_report(report, include_hidden=include_hidden)
+        await safe_edit_message(callback, text, reply_markup=brs_report_kb(report, include_hidden))
+    except Exception as exc:
+        logger.exception("Failed to handle BRS callback")
+        await safe_edit_message(
+            callback,
+            f"Не удалось получить БРС: <code>{exc}</code>",
+            reply_markup=main_menu_kb(False),
+        )
+
+
+@router.callback_query(F.data.startswith("brsd:"))
+async def cb_brs_detail(callback: CallbackQuery) -> None:
+    await acknowledge_callback(callback, text="Открываю предмет...")
+    parts = (callback.data or "").split(":")
+    if len(parts) < 5:
+        return
+
+    action = parts[1]
+    year = brs_decode_callback_value(parts[2])
+    semester = brs_decode_callback_value(parts[3])
+    discipline_id = parts[4]
+    force_refresh = action == "refresh"
+
+    try:
+        await safe_edit_message(
+            callback,
+            "📘 <b>Открываю предмет...</b>\n\n⏳ Загружаю детализацию баллов.",
+            reply_markup=None,
+        )
+        detail, report = await get_brs_discipline_detail_payload(
+            callback.from_user.id,
+            discipline_id,
+            year=year,
+            semester=semester,
+            force_refresh=force_refresh,
+        )
+        await safe_edit_message(
+            callback,
+            format_brs_detail(detail, report),
+            reply_markup=brs_detail_kb(report.current_year, report.current_semester),
+        )
+    except Exception as exc:
+        logger.exception("Failed to handle BRS discipline detail callback")
+        year, semester = resolve_brs_period(year, semester)
+        await safe_edit_message(
+            callback,
+            f"Не удалось открыть детализацию предмета: <code>{exc}</code>",
+            reply_markup=brs_detail_kb(year, semester),
+        )
 
 
 @router.callback_query(F.data == "menu:reminders")
@@ -1857,7 +2621,7 @@ async def cb_menu_auth(callback: CallbackQuery, state: FSMContext) -> None:
     await acknowledge_callback(callback, text="Проверяю авторизацию...")
     user = await get_user(callback.from_user.id)
     if is_user_authorized(user):
-        text = "🔐 <b>Профиль и сессия</b>\n\n" + auth_status_text(user)
+        text = "🔐 <b>Профиль iStudent</b>\n\n" + auth_status_text(user)
         await safe_edit_message(callback, text, reply_markup=auth_profile_kb())
         return
 
@@ -1889,6 +2653,13 @@ async def cb_today_offset(callback: CallbackQuery) -> None:
 
     logger.info("Callback today:offset from user_id=%s day_offset=%s", callback.from_user.id, day_offset)
     await acknowledge_callback(callback)
+    target_date = datetime.now(TIMEZONE).date() + timedelta(days=day_offset)
+    day_name = WEEKDAY_NAMES_RU.get(target_date.weekday(), "День")
+    await safe_edit_message(
+        callback,
+        schedule_loading_text("Открываю день", f"{day_name}, {target_date.strftime('%d.%m.%Y')}"),
+        reply_markup=None,
+    )
     text = await get_schedule_for_day(callback.from_user.id, day_offset=day_offset)
     await safe_edit_message(callback, text, reply_markup=day_nav_kb(day_offset))
 
@@ -1937,6 +2708,14 @@ async def cb_day_pick(callback: CallbackQuery) -> None:
         weekday_idx,
     )
     await acknowledge_callback(callback)
+    monday, _ = week_range_by_offset(week_offset)
+    target_date = monday + timedelta(days=weekday_idx)
+    day_name = WEEKDAY_NAMES_RU.get(weekday_idx, "День")
+    await safe_edit_message(
+        callback,
+        schedule_loading_text("Открываю день", f"{day_name}, {target_date.strftime('%d.%m.%Y')}"),
+        reply_markup=None,
+    )
     text = await get_schedule_for_weekday(callback.from_user.id, week_offset=week_offset, weekday_idx=weekday_idx)
     await safe_edit_message(callback, text, reply_markup=day_select_kb(week_offset))
 
@@ -1950,6 +2729,12 @@ async def cb_day_week(callback: CallbackQuery) -> None:
 
     logger.info("Callback day:week from user_id=%s week_offset=%s", callback.from_user.id, week_offset)
     await acknowledge_callback(callback)
+    monday, sunday = week_range_by_offset(week_offset)
+    await safe_edit_message(
+        callback,
+        schedule_loading_text("Открываю неделю", f"{monday.strftime('%d.%m')} - {sunday.strftime('%d.%m')}"),
+        reply_markup=None,
+    )
     text = await get_schedule_for_week(callback.from_user.id, week_offset=week_offset)
     await safe_edit_message(callback, text, reply_markup=week_nav_kb(week_offset))
 
@@ -1979,6 +2764,12 @@ async def cb_week(callback: CallbackQuery) -> None:
     week_offset = int(callback.data.split(":")[1])
     logger.info("Callback week:navigate from user_id=%s week_offset=%s", callback.from_user.id, week_offset)
     await acknowledge_callback(callback)
+    monday, sunday = week_range_by_offset(week_offset)
+    await safe_edit_message(
+        callback,
+        schedule_loading_text("Открываю неделю", f"{monday.strftime('%d.%m')} - {sunday.strftime('%d.%m')}"),
+        reply_markup=None,
+    )
     text = await get_schedule_for_week(callback.from_user.id, week_offset=week_offset)
     await safe_edit_message(callback, text, reply_markup=week_nav_kb(week_offset))
 

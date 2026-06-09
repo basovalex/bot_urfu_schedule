@@ -4,3 +4,4 @@ aiosqlite>=0.20,<1
 beautifulsoup4>=4.12,<5
 cryptography>=42,<45
 python-dotenv>=1.0,<2
+tzdata>=2024.1
